@@ -1,82 +1,89 @@
-name: Manga Translator Workflow
+name: Manga Translate
+run-name: "Task-${{ inputs.trigger_msg_id }}-${{ inputs.mode }}"
 
 on:
   workflow_dispatch:
     inputs:
       task_type:
-        description: 'Task Type (process/repeat)'
         required: true
+        type: string
       video_id:
-        description: 'Input Document Link (PDF/ZIP/Image)'
-        required: false
-        default: 'none'
+        required: true
+        type: string
       sub_id:
-        description: 'Translation TXT Link or Backup ZIP Link'
         required: false
-        default: 'none'
+        type: string
+        default: ""
       chat_id:
-        description: 'Telegram Chat ID'
         required: true
+        type: string
       user_id:
-        description: 'User ID'
         required: true
+        type: string
       trigger_msg_id:
-        description: 'Progress Message ID'
         required: true
+        type: string
       mode:
-        description: 'Translation Mode (normal / hienglish)'
         required: false
-        default: 'normal'
+        type: string
+        default: "normal"
 
 jobs:
-  translate_job:
+  process:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      API_ID: ${{ secrets.API_ID }}
+      API_HASH: ${{ secrets.API_HASH }}
+      BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+      TASK_TYPE: ${{ inputs.task_type }}
+      VIDEO_ID: ${{ inputs.video_id }}
+      SUB_ID: ${{ inputs.sub_id }}
+      CHAT_ID: ${{ inputs.chat_id }}
+      USER_ID: ${{ inputs.user_id }}
+      TRIGGER_MSG_ID: ${{ inputs.trigger_msg_id }}
+      MODE: ${{ inputs.mode }}
+      BUBBLE_MODEL_PATH: models/comic-speech-bubble-detector.pt
+
     steps:
-      - name: Checkout Code
+      - name: Checkout repo
         uses: actions/checkout@v4
 
       - name: Set up Python 3.10
         uses: actions/setup-python@v5
         with:
-          python-version: '3.10'
-          cache: 'pip'
+          python-version: "3.10"
+          cache: "pip"
+          cache-dependency-path: requirements.txt
 
-      - name: Install System Dependencies
-        run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y ffmpeg libgl1-mesa-glx poppler-utils fonts-dejavu-core
+      # Poppler is needed by pdf2image to rasterize PDF pages
+      - name: Install system dependencies
+        run: sudo apt-get update && sudo apt-get install -y poppler-utils
 
-      - name: Install Python Requirements
-        run: |
-          pip install pyrogram pillow opencv-python-headless pypdf requests pdf2image
+      # CPU-only torch build first — the default PyPI torch wheel bundles CUDA
+      # and is ~5x larger / slower to install, which we don't need on a
+      # 2-CPU runner with no GPU anyway.
+      - name: Install CPU-only PyTorch
+        run: pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
 
-      - name: Cache ML Bubble Detector Model
+      - name: Install Python dependencies
+        run: pip install -r requirements.txt
+
+      # Cache the ~52MB bubble-detector weights so they're only fetched once,
+      # not re-downloaded on every single run.
+      - name: Cache bubble detector model
         id: cache-model
-        uses: actions/cache@v3
+        uses: actions/cache@v4
         with:
           path: models
-          key: bubble-detector-v1
+          key: bubble-model-v1
 
-      - name: Download Bubble Detector Model (if not cached)
+      - name: Download bubble detector model
         if: steps.cache-model.outputs.cache-hit != 'true'
         run: |
           mkdir -p models
-          wget -q -O models/comic-speech-bubble-detector.pt \
-            "https://github.com/ogkalu/comic-speech-bubble-detector/releases/download/v1.0/comic-speech-bubble-detector.pt"
-          # Agar URL alag hai to sahi karo; yahaan sample diya hai.
+          curl -L -o models/comic-speech-bubble-detector.pt \
+            https://huggingface.co/ogkalu/comic-speech-bubble-detector-yolov8m/resolve/main/comic-speech-bubble-detector.pt
 
-      - name: Execute Translator Engine
-        env:
-          API_ID: ${{ secrets.API_ID }}
-          API_HASH: ${{ secrets.API_HASH }}
-          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
-          TASK_TYPE: ${{ github.event.inputs.task_type }}
-          VIDEO_ID: ${{ github.event.inputs.video_id }}
-          SUB_ID: ${{ github.event.inputs.sub_id }}
-          CHAT_ID: ${{ github.event.inputs.chat_id }}
-          USER_ID: ${{ github.event.inputs.user_id }}
-          TRIGGER_MSG_ID: ${{ github.event.inputs.trigger_msg_id }}
-          MODE: ${{ github.event.inputs.mode }}
-          BUBBLE_MODEL_PATH: models/comic-speech-bubble-detector.pt
-        run: |
-          python studio.py
+      - name: Run Manga Translator Worker
+        run: python studio.py
