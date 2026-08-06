@@ -1,0 +1,82 @@
+name: Manga Translator Workflow
+
+on:
+  workflow_dispatch:
+    inputs:
+      task_type:
+        description: 'Task Type (process/repeat)'
+        required: true
+      video_id:
+        description: 'Input Document Link (PDF/ZIP/Image)'
+        required: false
+        default: 'none'
+      sub_id:
+        description: 'Translation TXT Link or Backup ZIP Link'
+        required: false
+        default: 'none'
+      chat_id:
+        description: 'Telegram Chat ID'
+        required: true
+      user_id:
+        description: 'User ID'
+        required: true
+      trigger_msg_id:
+        description: 'Progress Message ID'
+        required: true
+      mode:
+        description: 'Translation Mode (normal / hienglish)'
+        required: false
+        default: 'normal'
+
+jobs:
+  translate_job:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.10
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+          cache: 'pip'
+
+      - name: Install System Dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y ffmpeg libgl1-mesa-glx poppler-utils fonts-dejavu-core
+
+      - name: Install Python Requirements
+        run: |
+          pip install pyrogram pillow opencv-python-headless pypdf requests pdf2image
+
+      - name: Cache ML Bubble Detector Model
+        id: cache-model
+        uses: actions/cache@v3
+        with:
+          path: models
+          key: bubble-detector-v1
+
+      - name: Download Bubble Detector Model (if not cached)
+        if: steps.cache-model.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p models
+          wget -q -O models/comic-speech-bubble-detector.pt \
+            "https://github.com/ogkalu/comic-speech-bubble-detector/releases/download/v1.0/comic-speech-bubble-detector.pt"
+          # Agar URL alag hai to sahi karo; yahaan sample diya hai.
+
+      - name: Execute Translator Engine
+        env:
+          API_ID: ${{ secrets.API_ID }}
+          API_HASH: ${{ secrets.API_HASH }}
+          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+          TASK_TYPE: ${{ github.event.inputs.task_type }}
+          VIDEO_ID: ${{ github.event.inputs.video_id }}
+          SUB_ID: ${{ github.event.inputs.sub_id }}
+          CHAT_ID: ${{ github.event.inputs.chat_id }}
+          USER_ID: ${{ github.event.inputs.user_id }}
+          TRIGGER_MSG_ID: ${{ github.event.inputs.trigger_msg_id }}
+          MODE: ${{ github.event.inputs.mode }}
+          BUBBLE_MODEL_PATH: models/comic-speech-bubble-detector.pt
+        run: |
+          python studio.py
