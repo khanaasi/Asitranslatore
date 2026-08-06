@@ -1,3 +1,4 @@
 pyrogram
 requests
 psutil
+opencv-python-headless
