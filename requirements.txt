@@ -1,4 +1,5 @@
 pyrogram
 requests
-psutil
 opencv-python-headless
+pillow
+pdf2image
