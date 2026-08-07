@@ -8,6 +8,7 @@ import numpy as np
 from PIL import Image, ImageDraw, ImageFont
 from pdf2image import convert_from_path
 
+
 def _natural_key(s):
     """Sorts '2.jpg' before '10.jpg'."""
     return [int(t) if t.isdigit() else t.lower() for t in re.split(r'(\d+)', s)]
@@ -66,7 +67,7 @@ def _get_bubble_model():
             raise FileNotFoundError(f"Bubble model weights not found at {model_path}")
         _yolo_model = YOLO(model_path)
     except Exception as e:
-        print(f"[bubble-detector] ML model unavailable, will use OpenCV fallback: {e}")
+        print(f"[bubble-detector] ML model unavailable: {e}")
         _yolo_load_failed = True
         _yolo_model = None
     return _yolo_model
@@ -92,21 +93,176 @@ def detect_bubbles(image_path):
     try:
         return detect_bubbles_ml(image_path)
     except Exception as e:
-        print(f"[bubble-detector] Falling back to OpenCV for this page: {e}")
+        print(f"[bubble-detector] Falling back to OpenCV: {e}")
         return detect_bubbles_opencv(image_path)
 
 
 # --- OCR Loader ----------------------------------------------------
 _ocr_reader = None
 
+
 def get_ocr_reader():
     global _ocr_reader
     if _ocr_reader is None:
         import easyocr
-        # Using English and Japanese to cover raw translations.
-        # Directing models to the local 'models' folder to ensure easy caching.
         _ocr_reader = easyocr.Reader(['ja', 'en'], gpu=False, model_storage_directory="models")
     return _ocr_reader
+
+
+def merge_boxes(boxes_with_text, y_threshold=30, x_threshold=50):
+    """
+    Groups vertically and horizontally close text bounding boxes.
+    """
+    if not boxes_with_text:
+        return []
+    
+    # Sort primarily by top coordinate (y)
+    sorted_items = sorted(boxes_with_text, key=lambda item: item["box"][1])
+    
+    merged = []
+    for item in sorted_items:
+        bx, by, bw, bh = item["box"]
+        b_text = item["text"]
+        
+        merged_any = False
+        for m in merged:
+            mx, my, mw, mh = m["box"]
+            
+            # Check if vertical gap is small
+            vertical_close = (by - (my + mh)) < y_threshold and (by >= my - 5)
+            
+            # Check if they overlap or are very close horizontally
+            horizontal_close = not (bx + bw + x_threshold < mx or mx + mw + x_threshold < bx)
+            
+            if vertical_close and horizontal_close:
+                new_x = min(mx, bx)
+                new_y = min(my, by)
+                new_w = max(mx + mw, bx + bw) - new_x
+                new_h = max(my + mh, by + bh) - new_y
+                
+                m["box"] = (new_x, new_y, new_w, new_h)
+                m["text"] = m["text"] + " " + b_text
+                merged_any = True
+                break
+                
+        if not merged_any:
+            merged.append({"box": (bx, by, bw, bh), "text": b_text})
+            
+    return merged
+
+
+def get_page_dialogues(image_path):
+    """
+    Detects actual dialogues on a page.
+    Combines YOLO/OpenCV bubble detection with EasyOCR text detection.
+    Only keeps regions that contain actual text, and maps them to clean boundaries.
+    """
+    try:
+        # 1. Run OCR on the whole image
+        reader = None
+        ocr_results = []
+        try:
+            reader = get_ocr_reader()
+            ocr_results = reader.readtext(image_path)
+        except Exception as e:
+            print(f"[OCR-detect] Failed to run EasyOCR: {e}")
+
+        ocr_boxes = []
+        for bbox, text, conf in ocr_results:
+            text = text.strip()
+            if not text:
+                continue
+            xs = [p[0] for p in bbox]
+            ys = [p[1] for p in bbox]
+            x = int(min(xs))
+            y = int(min(ys))
+            w = int(max(xs) - x)
+            h = int(max(ys) - y)
+            if w > 0 and h > 0:
+                ocr_boxes.append({"box": (x, y, w, h), "text": text})
+
+        grouped_ocr = merge_boxes(ocr_boxes)
+
+        # 2. Run Bubble Detection
+        bubbles = []
+        try:
+            bubbles = detect_bubbles(image_path)
+        except Exception as e:
+            print(f"[Bubble-detect] Failed to detect bubbles: {e}")
+
+        # 3. Match grouped OCR blocks with bubbles
+        dialogues = []
+        matched_ocr_indices = set()
+
+        for bx, by, bw, bh in bubbles:
+            bubble_text_parts = []
+            bubble_contains_text = False
+            
+            for ocr_idx, ocr_item in enumerate(grouped_ocr):
+                ox, oy, ow, oh = ocr_item["box"]
+                
+                # Overlap check
+                ix = max(bx, ox)
+                iy = max(by, oy)
+                iw = min(bx + bw, ox + ow) - ix
+                ih = min(by + bh, oy + oh) - iy
+                
+                if iw > 0 and ih > 0:
+                    overlap_area = iw * ih
+                    ocr_area = ow * oh
+                    # If 30%+ of the text is inside the bubble
+                    if overlap_area / ocr_area > 0.3:
+                        bubble_text_parts.append(ocr_item["text"])
+                        bubble_contains_text = True
+                        matched_ocr_indices.add(ocr_idx)
+
+            if bubble_contains_text:
+                combined_text = " ".join(bubble_text_parts).strip()
+                dialogues.append({
+                    "bbox": [bx, by, bx + bw, by + bh],
+                    "text": combined_text
+                })
+
+        # 4. Add remaining unmatched OCR text blocks (e.g. orange boxes, colored text)
+        for ocr_idx, ocr_item in enumerate(grouped_ocr):
+            if ocr_idx not in matched_ocr_indices:
+                ox, oy, ow, oh = ocr_item["box"]
+                pad = 6
+                img_w, img_h = 10000, 10000
+                try:
+                    with Image.open(image_path) as img_temp:
+                        img_w, img_h = img_temp.size
+                except Exception:
+                    pass
+                
+                x1 = max(0, ox - pad)
+                y1 = max(0, oy - pad)
+                x2 = min(img_w, ox + ow + pad)
+                y2 = min(img_h, oy + oh + pad)
+                
+                dialogues.append({
+                    "bbox": [x1, y1, x2, y2],
+                    "text": ocr_item["text"]
+                })
+
+        dialogues.sort(key=lambda d: d["bbox"][1])
+        return dialogues
+
+    except Exception as e:
+        print(f"[Hybrid-dialogue-detection] Error: {e}, falling back to default OpenCV bubble detection")
+        bubbles = []
+        try:
+            bubbles = detect_bubbles(image_path)
+        except Exception:
+            bubbles = detect_bubbles_opencv(image_path)
+        
+        fallback_dialogues = []
+        for bx, by, bw, bh in bubbles:
+            fallback_dialogues.append({
+                "bbox": [bx, by, bx + bw, by + bh],
+                "text": "[Translate]"
+            })
+        return fallback_dialogues
 
 
 def split_text_to_lines(text, max_width, draw, font):
@@ -170,13 +326,6 @@ def process_phase1_engine(input_path, output_dir, mode_label="normal", progress_
     if not ordered_paths:
         raise Exception("No valid manga pages found inside the uploaded file.")
 
-    # Initialize OCR Reader
-    reader = None
-    try:
-        reader = get_ocr_reader()
-    except Exception as ocr_err:
-        print(f"[OCR-init] Failed to initialize EasyOCR: {ocr_err}")
-
     translation_map = {}
     txt_lines = [f"# Mode: {mode_label.upper()}", "# Translate text after the '=Dialogue=' marker. Keep the ID matching."]
     total_pages = len(ordered_paths)
@@ -187,7 +336,7 @@ def process_phase1_engine(input_path, output_dir, mode_label="normal", progress_
         page_ext = os.path.splitext(src_path)[1].lower() or ".png"
         page_file = f"{page_idx + 1:04d}{page_ext}"
 
-        bubbles = detect_bubbles(src_path)
+        dialogues = get_page_dialogues(src_path)
 
         img_clean = Image.open(src_path).convert("RGB")
         img_numbered = img_clean.copy()
@@ -198,33 +347,20 @@ def process_phase1_engine(input_path, output_dir, mode_label="normal", progress_
         page_key = f"Page{page_idx + 1:03d}"
         translation_map[page_key] = []
 
-        for b_idx, (x, y, w, h) in enumerate(bubbles):
+        for b_idx, d_item in enumerate(dialogues):
             bubble_id = f"{page_key}_Bubble{b_idx + 1}"
+            x1, y1, x2, y2 = d_item["bbox"]
+            ocr_text = d_item["text"]
 
-            # Extract dialogues from bubble area before drawing white box
-            ocr_text = ""
-            if reader:
-                try:
-                    bubble_crop = img_clean.crop((x, y, x + w, y + h))
-                    crop_np = np.array(bubble_crop)
-                    results = reader.readtext(crop_np, detail=0)
-                    if results:
-                        ocr_text = " ".join(results).strip()
-                except Exception as ocr_run_err:
-                    print(f"[OCR-run] Error running OCR on {bubble_id}: {ocr_run_err}")
+            draw_clean.rectangle([x1, y1, x2, y2], fill=(255, 255, 255))
 
-            if not ocr_text:
-                ocr_text = "[Translate]"
-
-            draw_clean.rectangle([x, y, x + w, y + h], fill=(255, 255, 255))
-
-            draw_num.rectangle([x, y, x + w, y + h], outline=(255, 0, 0), width=3)
-            draw_num.ellipse([x - 12, y - 12, x + 12, y + 12], fill=(255, 0, 0))
-            draw_num.text((x - 6, y - 9), str(b_idx + 1), fill=(255, 255, 255), font=font_num)
+            draw_num.rectangle([x1, y1, x2, y2], outline=(255, 0, 0), width=3)
+            draw_num.ellipse([x1 - 12, y1 - 12, x1 + 12, y1 + 12], fill=(255, 0, 0))
+            draw_num.text((x1 - 6, y1 - 9), str(b_idx + 1), fill=(255, 255, 255), font=font_num)
 
             translation_map[page_key].append({
                 "id": bubble_id,
-                "bbox": [x, y, x + w, y + h]
+                "bbox": [x1, y1, x2, y2]
             })
             txt_lines.append(f"{bubble_id}=Dialogue={ocr_text}")
 
