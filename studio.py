@@ -117,14 +117,27 @@ async def download_telegram_file(app, file_link, output_name, label="📥 <b>Dow
 
 
 async def wait_for_translated_txt(app, since_ts):
-    """Poll USER's private chat for the .txt reply."""
+    """Poll USER's private chat for the .txt reply in a timezone-robust way."""
+    from datetime import datetime, timezone
+    since_dt = datetime.fromtimestamp(since_ts, timezone.utc)
+    
     deadline = since_ts + WAIT_FOR_TXT_SECONDS
     while time.time() < deadline:
         await asyncio.sleep(POLL_INTERVAL_SECONDS)
         try:
-            # ✅ FIXED: Poll USER_ID (private chat) instead of CHAT_ID
-            async for msg in app.get_chat_history(USER_ID, limit=8):
-                if not msg.date or msg.date.timestamp() < since_ts - 3:
+            async for msg in app.get_chat_history(USER_ID, limit=15):
+                if not msg.date:
+                    continue
+                
+                # Align both times as UTC aware datetimes
+                msg_date = msg.date
+                if msg_date.tzinfo is None:
+                    msg_date = msg_date.replace(tzinfo=timezone.utc)
+                else:
+                    msg_date = msg_date.astimezone(timezone.utc)
+                
+                # Allow a small clock drift grace window (5 seconds)
+                if (since_dt - msg_date).total_seconds() > 5:
                     continue
                 if not msg.from_user or msg.from_user.id != USER_ID:
                     continue
@@ -141,6 +154,12 @@ async def main():
     app = Client("worker_engine", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN, no_updates=True)
     await app.start()
 
+    # Pre-resolve peer cache to avoid PeerIdInvalid errors during polling
+    try:
+        await app.get_chat(USER_ID)
+    except Exception as e:
+        print(f"Pre-resolving USER_ID failed: {e}")
+
     page_reporter = ThrottledReporter()
 
     try:
@@ -154,7 +173,6 @@ async def main():
             def page_progress(done, total):
                 page_reporter.maybe_report("⚙️ <b>Detecting Bubbles & Preparing Pages...</b>", done, total)
 
-            # Font path pass kiya (internally use hoga)
             backup_zip, txt_path, clean_dir, translation_map = await asyncio.to_thread(
                 process_phase1_engine, doc_path, WORK_DIR, MODE, page_progress, font_path=FONT_PATH
             )
