@@ -4,9 +4,9 @@ import cv2
 import json
 import shutil
 import zipfile
+import numpy as np
 from PIL import Image, ImageDraw, ImageFont
 from pdf2image import convert_from_path
-
 
 def _natural_key(s):
     """Sorts '2.jpg' before '10.jpg'."""
@@ -50,7 +50,7 @@ def detect_bubbles_opencv(image_path):
     return bubbles
 
 
-# --- ML-based bubble detection (optional) ------------------------------------
+# --- ML-based bubble detection ------------------------------------
 _yolo_model = None
 _yolo_load_failed = False
 
@@ -94,6 +94,19 @@ def detect_bubbles(image_path):
     except Exception as e:
         print(f"[bubble-detector] Falling back to OpenCV for this page: {e}")
         return detect_bubbles_opencv(image_path)
+
+
+# --- OCR Loader ----------------------------------------------------
+_ocr_reader = None
+
+def get_ocr_reader():
+    global _ocr_reader
+    if _ocr_reader is None:
+        import easyocr
+        # Using English and Japanese to cover raw translations.
+        # Directing models to the local 'models' folder to ensure easy caching.
+        _ocr_reader = easyocr.Reader(['ja', 'en'], gpu=False, model_storage_directory="models")
+    return _ocr_reader
 
 
 def split_text_to_lines(text, max_width, draw, font):
@@ -157,6 +170,13 @@ def process_phase1_engine(input_path, output_dir, mode_label="normal", progress_
     if not ordered_paths:
         raise Exception("No valid manga pages found inside the uploaded file.")
 
+    # Initialize OCR Reader
+    reader = None
+    try:
+        reader = get_ocr_reader()
+    except Exception as ocr_err:
+        print(f"[OCR-init] Failed to initialize EasyOCR: {ocr_err}")
+
     translation_map = {}
     txt_lines = [f"# Mode: {mode_label.upper()}", "# Translate text after the '=Dialogue=' marker. Keep the ID matching."]
     total_pages = len(ordered_paths)
@@ -181,6 +201,21 @@ def process_phase1_engine(input_path, output_dir, mode_label="normal", progress_
         for b_idx, (x, y, w, h) in enumerate(bubbles):
             bubble_id = f"{page_key}_Bubble{b_idx + 1}"
 
+            # Extract dialogues from bubble area before drawing white box
+            ocr_text = ""
+            if reader:
+                try:
+                    bubble_crop = img_clean.crop((x, y, x + w, y + h))
+                    crop_np = np.array(bubble_crop)
+                    results = reader.readtext(crop_np, detail=0)
+                    if results:
+                        ocr_text = " ".join(results).strip()
+                except Exception as ocr_run_err:
+                    print(f"[OCR-run] Error running OCR on {bubble_id}: {ocr_run_err}")
+
+            if not ocr_text:
+                ocr_text = "[Translate]"
+
             draw_clean.rectangle([x, y, x + w, y + h], fill=(255, 255, 255))
 
             draw_num.rectangle([x, y, x + w, y + h], outline=(255, 0, 0), width=3)
@@ -191,7 +226,7 @@ def process_phase1_engine(input_path, output_dir, mode_label="normal", progress_
                 "id": bubble_id,
                 "bbox": [x, y, x + w, y + h]
             })
-            txt_lines.append(f"{bubble_id}=Dialogue=[Translate]")
+            txt_lines.append(f"{bubble_id}=Dialogue={ocr_text}")
 
         img_clean.save(os.path.join(clean_dir, page_file))
         img_numbered.save(os.path.join(numbered_dir, page_file))
